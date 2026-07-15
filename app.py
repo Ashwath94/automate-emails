@@ -16,7 +16,7 @@ load_dotenv()
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 LOCAL_ACCOUNTS_FILE = "accounts.local.json"
 
-st.set_page_config(page_title="Bulk Email Sender", layout="wide")
+st.set_page_config(page_title="Email Sender", layout="wide")
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -68,7 +68,7 @@ def check_passcode() -> bool:
         return True
     if st.session_state.get("authed"):
         return True
-    st.title("Bulk Email Sender")
+    st.title("Email Sender")
     code = st.text_input("Enter passcode", type="password")
     if st.button("Unlock"):
         if code == required:
@@ -99,7 +99,7 @@ if "recipients" not in st.session_state:
 if "names" not in st.session_state:
     st.session_state.names = {}
 
-st.title("Bulk Email Sender")
+st.title("Email Sender")
 
 col1, col2 = st.columns([1, 1])
 
