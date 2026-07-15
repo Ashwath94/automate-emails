@@ -1,0 +1,8 @@
+[
+  {
+    "email": "account1@gmail.com",
+    "client_id": "xxxx.apps.googleusercontent.com",
+    "client_secret": "xxxx",
+    "refresh_token": "xxxx"
+  }
+]

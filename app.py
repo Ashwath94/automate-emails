@@ -1,13 +1,20 @@
+import base64
+import json
 import os
 import re
-import smtplib
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 
 import streamlit as st
 from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 load_dotenv()
+
+GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+LOCAL_ACCOUNTS_FILE = "accounts.local.json"
 
 st.set_page_config(page_title="Bulk Email Sender", layout="wide")
 
@@ -21,6 +28,38 @@ def get_secret(key: str, default: str = "") -> str:
     except FileNotFoundError:
         pass
     return os.getenv(key, default)
+
+
+def get_gmail_accounts() -> list[dict]:
+    try:
+        if "gmail_accounts" in st.secrets:
+            return [dict(a) for a in st.secrets["gmail_accounts"]]
+    except FileNotFoundError:
+        pass
+    if os.path.exists(LOCAL_ACCOUNTS_FILE):
+        with open(LOCAL_ACCOUNTS_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def send_via_gmail_api(account: dict, to_addr: str, subject: str, body: str) -> None:
+    creds = Credentials(
+        None,
+        refresh_token=account["refresh_token"],
+        client_id=account["client_id"],
+        client_secret=account["client_secret"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=[GMAIL_SEND_SCOPE],
+    )
+    creds.refresh(Request())
+    service = build("gmail", "v1", credentials=creds)
+
+    msg = MIMEText(body)
+    msg["To"] = to_addr
+    msg["From"] = account["email"]
+    msg["Subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def check_passcode() -> bool:
@@ -165,47 +204,38 @@ else:
 st.divider()
 st.subheader("4. Send")
 
-from_email = st.text_input("From (Gmail address)", value=get_secret("GMAIL_ADDRESS"))
-app_password = st.text_input(
-    "Gmail App Password",
-    value=get_secret("GMAIL_APP_PASSWORD"),
-    type="password",
-    help="16-character App Password from myaccount.google.com/apppasswords (requires 2FA enabled).",
-)
+accounts = get_gmail_accounts()
 
-valid_recipients = [e for e in st.session_state.recipients if EMAIL_RE.match(e)]
+if not accounts:
+    st.warning(
+        "No Gmail accounts configured. Add one or more entries under "
+        "`gmail_accounts` in secrets (see .streamlit/secrets.toml.example)."
+    )
+else:
+    account_emails = [a["email"] for a in accounts]
+    selected_email = st.selectbox("Send from", account_emails)
+    selected_account = next(a for a in accounts if a["email"] == selected_email)
 
-send_disabled = not (from_email and app_password and valid_recipients and subject and body_template)
-if st.button("Send Email", type="primary", disabled=send_disabled):
-    progress = st.progress(0, text="Connecting to Gmail...")
-    sent, failed = [], []
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(from_email, app_password)
-            for i, e in enumerate(valid_recipients):
-                name = st.session_state.names.get(e, first_name_from_email(e))
-                full_body = f"Hi {name},\n\n{body_template}"
-                msg = MIMEMultipart()
-                msg["From"] = from_email
-                msg["To"] = e
-                msg["Subject"] = subject
-                msg.attach(MIMEText(full_body, "plain"))
-                try:
-                    server.sendmail(from_email, e, msg.as_string())
-                    sent.append(e)
-                except Exception as ex:
-                    failed.append((e, str(ex)))
-                progress.progress((i + 1) / len(valid_recipients), text=f"Sent to {e}")
-    except smtplib.SMTPAuthenticationError:
-        st.error(
-            "Authentication failed. Make sure 2FA is enabled on the Gmail account "
-            "and you're using an App Password, not your regular password."
-        )
-    except Exception as ex:
-        st.error(f"Failed to connect/send: {ex}")
-    else:
+    valid_recipients = [e for e in st.session_state.recipients if EMAIL_RE.match(e)]
+
+    send_disabled = not (valid_recipients and subject and body_template)
+    if st.button("Send Email", type="primary", disabled=send_disabled):
+        progress = st.progress(0, text="Sending...")
+        sent, failed = [], []
+        for i, e in enumerate(valid_recipients):
+            name = st.session_state.names.get(e, first_name_from_email(e))
+            full_body = f"Hi {name},\n\n{body_template}"
+            try:
+                send_via_gmail_api(selected_account, e, subject, full_body)
+                sent.append(e)
+            except HttpError as ex:
+                failed.append((e, str(ex)))
+            except Exception as ex:
+                failed.append((e, str(ex)))
+            progress.progress((i + 1) / len(valid_recipients), text=f"Sent to {e}")
+
         if sent:
-            st.success(f"Sent successfully to {len(sent)} recipient(s).")
+            st.success(f"Sent successfully to {len(sent)} recipient(s) from {selected_email}.")
         if failed:
             st.error(f"Failed for {len(failed)} recipient(s):")
             for e, err in failed:

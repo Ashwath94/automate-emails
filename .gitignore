@@ -1,5 +1,8 @@
 .env
 .streamlit/secrets.toml
+accounts.local.json
+credentials*.json
+secrets/
 __pycache__/
 *.pyc
 .venv/
