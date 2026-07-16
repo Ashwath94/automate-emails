@@ -1,8 +1,14 @@
 import base64
+import html
 import json
+import mimetypes
 import os
 import re
+from email.mime.base import MIMEBase
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -15,6 +21,34 @@ load_dotenv()
 
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 LOCAL_ACCOUNTS_FILE = "accounts.local.json"
+LOGO_PATH = "assets/logo.png"
+MAX_EMAIL_SIZE_BYTES = 25 * 1024 * 1024
+
+def _signature_html(logo_src: str) -> str:
+    return f"""
+<p>Looking forward to connecting,</p>
+<p>
+<b>ANU KUMAR</b><br>
+Sr. Client Services Manager<br>
+<img src="{logo_src}" alt="logo" style="max-width:45px; margin: 6px 0;"><br>
+W: clearlightinsights.com&nbsp;&nbsp;A: 418 Broadway #4245, Albany, NY, 12207, USA
+</p>
+"""
+
+
+def build_html_body(name: str, body_template: str, logo_src: str = "cid:logo") -> str:
+    greeting = html.escape(f"Hi {name},")
+    body_escaped = html.escape(body_template).replace("\n", "<br>")
+    return f"<p>{greeting}</p><p>{body_escaped}</p>{_signature_html(logo_src)}"
+
+
+def logo_data_uri() -> str:
+    if not os.path.exists(LOGO_PATH):
+        return ""
+    with open(LOGO_PATH, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode()
+    mime, _ = mimetypes.guess_type(LOGO_PATH)
+    return f"data:{mime or 'image/png'};base64,{encoded}"
 
 st.set_page_config(page_title="Email Sender", layout="wide")
 
@@ -42,7 +76,13 @@ def get_gmail_accounts() -> list[dict]:
     return []
 
 
-def send_via_gmail_api(account: dict, to_addr: str, subject: str, body: str) -> None:
+def send_via_gmail_api(
+    account: dict,
+    to_addr: str,
+    subject: str,
+    html_body: str,
+    attachments: list[dict] | None = None,
+) -> None:
     creds = Credentials(
         None,
         refresh_token=account["refresh_token"],
@@ -54,10 +94,30 @@ def send_via_gmail_api(account: dict, to_addr: str, subject: str, body: str) -> 
     creds.refresh(Request())
     service = build("gmail", "v1", credentials=creds)
 
-    msg = MIMEText(body)
+    msg = MIMEMultipart("mixed")
     msg["To"] = to_addr
     msg["From"] = account["email"]
     msg["Subject"] = subject
+
+    related = MIMEMultipart("related")
+    related.attach(MIMEText(html_body, "html"))
+    if os.path.exists(LOGO_PATH):
+        with open(LOGO_PATH, "rb") as f:
+            logo = MIMEImage(f.read())
+        logo.add_header("Content-ID", "<logo>")
+        logo.add_header("Content-Disposition", "inline", filename=os.path.basename(LOGO_PATH))
+        related.attach(logo)
+    msg.attach(related)
+
+    for att in attachments or []:
+        ctype, _ = mimetypes.guess_type(att["filename"])
+        maintype, subtype = (ctype.split("/", 1) if ctype else ("application", "octet-stream"))
+        part = MIMEBase(maintype, subtype)
+        part.set_payload(att["data"])
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=att["filename"])
+        msg.attach(part)
+
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
@@ -98,19 +158,41 @@ if "recipients" not in st.session_state:
     st.session_state.recipients = []
 if "names" not in st.session_state:
     st.session_state.names = {}
+if "reset_counter" not in st.session_state:
+    st.session_state.reset_counter = 0
 
-st.title("Email Sender")
+title_col, reset_col = st.columns([5, 1])
+title_col.title("Email Sender")
+if reset_col.button("Reset all", use_container_width=True):
+    st.session_state.recipients = []
+    st.session_state.names = {}
+    st.session_state.reset_counter += 1
+    st.rerun()
+
+rk = st.session_state.reset_counter
 
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.subheader("1. Email content")
-    subject = st.text_input("Subject")
+    subject = st.text_input("Subject", key=f"subject_{rk}")
     body_template = st.text_area(
-        "Body (use {name} for the recipient's first name; 'Hi {name},' is prepended automatically)",
+        "Body ('Hi {name},' is prepended and the signature + logo appended automatically)",
         height=250,
-        placeholder="Hope you're doing well...\n\nBest,\nAshwath",
+        placeholder="Hope you're doing well...",
+        key=f"body_{rk}",
     )
+    uploaded_files = st.file_uploader(
+        "Attachments (optional, same files sent with every email)",
+        accept_multiple_files=True,
+        key=f"attachments_{rk}",
+    )
+    attachments = [{"filename": f.name, "data": f.getvalue()} for f in uploaded_files] if uploaded_files else []
+    if attachments:
+        total_size = sum(len(a["data"]) for a in attachments)
+        st.caption(f"{len(attachments)} file(s), {total_size / 1_000_000:.1f} MB total")
+        if total_size > MAX_EMAIL_SIZE_BYTES:
+            st.error("Attachments exceed Gmail's 25 MB limit per email. Remove some files.")
 
 with col2:
     st.subheader("2. Recipients")
@@ -118,6 +200,7 @@ with col2:
         "Paste comma-separated emails",
         height=100,
         placeholder="john.doe@example.com, jane@company.com",
+        key=f"raw_recipients_{rk}",
     )
 
     add_col, clear_col = st.columns([1, 1])
@@ -190,14 +273,17 @@ st.divider()
 st.subheader(f"3. Preview ({len(st.session_state.recipients)} emails)")
 
 if st.session_state.recipients and body_template:
+    preview_logo_src = logo_data_uri() or "cid:logo"
     with st.container(height=350):
         for e in st.session_state.recipients:
             valid = bool(EMAIL_RE.match(e))
             name = st.session_state.names.get(e, first_name_from_email(e))
-            full_body = f"Hi {name},\n\n{body_template}"
+            preview_html = build_html_body(name, body_template, logo_src=preview_logo_src)
             with st.expander(f"{'✅' if valid else '⚠️ invalid'}  {e}", expanded=False):
                 st.text(f"Subject: {subject}")
-                st.text(full_body)
+                if attachments:
+                    st.caption("Attachments: " + ", ".join(a["filename"] for a in attachments))
+                st.markdown(preview_html, unsafe_allow_html=True)
 else:
     st.info("Add recipients and body content to see previews.")
 
@@ -218,15 +304,18 @@ else:
 
     valid_recipients = [e for e in st.session_state.recipients if EMAIL_RE.match(e)]
 
-    send_disabled = not (valid_recipients and subject and body_template)
+    attachments_total_size = sum(len(a["data"]) for a in attachments)
+    send_disabled = not (valid_recipients and subject and body_template) or (
+        attachments_total_size > MAX_EMAIL_SIZE_BYTES
+    )
     if st.button("Send Email", type="primary", disabled=send_disabled):
         progress = st.progress(0, text="Sending...")
         sent, failed = [], []
         for i, e in enumerate(valid_recipients):
             name = st.session_state.names.get(e, first_name_from_email(e))
-            full_body = f"Hi {name},\n\n{body_template}"
+            html_body = build_html_body(name, body_template)
             try:
-                send_via_gmail_api(selected_account, e, subject, full_body)
+                send_via_gmail_api(selected_account, e, subject, html_body, attachments)
                 sent.append(e)
             except HttpError as ex:
                 failed.append((e, str(ex)))
